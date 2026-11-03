@@ -9,12 +9,14 @@ Secrets: GEMINI_API_KEY, ELEVENLABS_API_KEY
 """
 
 import os, sys, re, json, time, glob, shutil, subprocess, wave, uuid, threading, signal
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import envload  # noqa  (.env padikkum, Windows UTF-8)
 from types import SimpleNamespace as _NS
 from concurrent.futures import ThreadPoolExecutor
 
 # ----------------------------- CONFIG ---------------------------------------
 VIDEO_PATH   = ""        # kaali na /kaggle/input-la irukkura mudhal video edukkum
-OUT_DIR      = "/kaggle/working" if os.path.exists("/kaggle/working") else "."
+OUT_DIR      = os.path.dirname(os.path.abspath(__file__))
 WORK         = os.path.join(OUT_DIR, "work")
 OUTPUT_VIDEO = os.path.join(OUT_DIR, "dubbed_tamil.mp4")
 
@@ -25,7 +27,7 @@ TTS_FALLBACK = "gemini-3.8-flash-lite-tts"
 CHUNK_MIN    = 8         # video-va ivlo nimisham thundaa pirichu anuppum
 PROXY_HEIGHT = 480       # Gemini-ku anuppa chinna video (upload vegam)
 MAX_SPEEDUP  = 1.35      # Tamil vari neelamaa irundha max vegappaduthal
-TTS_WORKERS  = 2         # ElevenLabs Starter-ku concurrency kuraivu; 429 vandha 1 aakkunga
+TTS_WORKERS  = int(os.environ.get("TTS_WORKERS", "3"))   # 429 niraya vandha .env-la TTS_WORKERS=2 (illa 1) vainga
 
 # ---- ElevenLabs
 ELEVEN_MODEL = os.environ.get("ELEVEN_MODEL", "eleven_v3")   # v3 = acting/emotion (audio tags). Stable: eleven_multilingual_v2
@@ -63,25 +65,35 @@ def report(pct, text):
         pass
 
 
+def _kill_tree(p):
+    """Neelamaana process (demucs/ffmpeg) + adhoda child-a nirutthum (Windows + Linux)."""
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)], capture_output=True)
+        else:
+            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+    except Exception:
+        pass
+
+
 def sh(cmd, check=True):
     check_cancel()
+    kw = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
+          else {"start_new_session": True})
     p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                         text=True, start_new_session=True)
+                         encoding="utf-8", errors="replace", **kw)
     while True:
         try:
             out, err = p.communicate(timeout=1)
             break
         except subprocess.TimeoutExpired:
-            if CANCEL.is_set():                      # demucs maadhiri neelamaana process-a nirutthum
-                try:
-                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
-                except Exception:
-                    pass
+            if CANCEL.is_set():
+                _kill_tree(p)
                 p.communicate()
                 raise Cancelled()
     r = _NS(returncode=p.returncode, stdout=out, stderr=err)
     if check and r.returncode != 0:
-        raise RuntimeError(f"CMD FAILED: {cmd}\n{err[-1500:]}")
+        raise RuntimeError(f"CMD FAILED: {cmd}\n{(err or '')[-1500:]}")
     return r
 
 
@@ -89,16 +101,16 @@ def ensure_deps():
     try:
         import google.genai  # noqa
     except ImportError:
-        sh(f"{sys.executable} -m pip install -q google-genai")
+        sh(f'"{sys.executable}" -m pip install -q google-genai')
     try:
         import demucs  # noqa
     except ImportError:
-        sh(f"{sys.executable} -m pip install -q demucs", check=False)
+        sh(f'"{sys.executable}" -m pip install -q demucs', check=False)
     import numpy  # noqa
     try:
         import requests  # noqa
     except ImportError:
-        sh(f"{sys.executable} -m pip install -q requests")
+        sh(f'"{sys.executable}" -m pip install -q requests')
 
 
 ensure_deps()
@@ -177,7 +189,7 @@ def find_video():
     for root in ("/kaggle/input", "/kaggle/working", "."):
         for ext in ("mp4", "mkv", "mov", "webm", "avi"):
             hits = glob.glob(os.path.join(root, "**", f"*.{ext}"), recursive=True)
-            hits = [h for h in hits if "dubbed_tamil" not in h and "/work/" not in h]
+            hits = [h for h in hits if "dubbed_tamil" not in h and "/work/" not in h.replace("\\", "/")]
             if hits:
                 return hits[0]
     raise SystemExit("Video kidaikala. VIDEO_PATH set pannunga.")
@@ -192,7 +204,8 @@ def step_bgm(video):
     print("[1] Audio eduthu BGM pirikkirom (CPU-la konjam neram aagum)...")
     full = os.path.join(WORK, "full_audio.wav")
     sh(f'ffmpeg -y -i "{video}" -vn -ac 2 -ar 44100 "{full}"')
-    r = sh(f'{sys.executable} -m demucs --two-stems=vocals -n htdemucs '
+    extra = os.environ.get("DEMUCS_EXTRA", "")      # e.g. "-j 2" (experiment)
+    r = sh(f'"{sys.executable}" -m demucs --two-stems=vocals -n htdemucs -d cpu --overlap 0.1 {extra} '
            f'-o "{WORK}/demucs" "{full}"', check=False)
     hits = glob.glob(os.path.join(WORK, "demucs", "**", "no_vocals.wav"), recursive=True)
     if r.returncode == 0 and hits:
@@ -206,6 +219,29 @@ def step_bgm(video):
         print("  ", r.stderr[-400:])
         sh(f'ffmpeg -y -i "{full}" -af volume=0.12 "{bgm_path}"')
     return bgm_path
+
+
+class BgmJob:
+    """demucs-a background thread-la odum; adhe neram Gemini script ezhuthum (laptop-la neram migum)."""
+
+    def __init__(self, video):
+        self.video, self.result, self.err = video, None, None
+        self.t = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self.t.start()
+
+    def _run(self):
+        try:
+            self.result = step_bgm(self.video)
+        except BaseException as e:  # noqa  (Cancelled-um)
+            self.err = e
+
+    def wait(self):
+        self.t.join()
+        if self.err:
+            raise self.err
+        return self.result
 
 
 # ----------------------------- STEP 2: Gemini script ------------------------
@@ -501,7 +537,7 @@ def polish(lines, chars):
     print(f"  {done}/{len(lines)} varigal maathapattana")
 
 
-def step_script(video):
+def step_script(video, before_gaps=None):
     script_path = os.path.join(WORK, "script.json")
     if os.path.exists(script_path):
         print("[2] script.json cache irukku, skip")
@@ -522,6 +558,9 @@ def step_script(video):
         lines += run_clip(clip, off, chars)
 
     lines.sort(key=lambda x: x["start"])
+    if before_gaps:
+        report(54, "குரல்/BGM பிரிப்பு முடியக் காத்திருக்குது")
+        before_gaps()          # gap check-ku vocals.wav venum
     report(55, "விடுபட்ட பேச்சு இருக்கான்னு பாக்குது")
     lines = fill_gaps(proxy, lines, chars, total)
     for sp in {l["speaker"] for l in lines}:
@@ -1104,11 +1143,14 @@ def dub(video, job_dir, progress=None, fmt="mp4", model=None):
     OUTPUT_VIDEO = os.path.join(job_dir, f"dubbed_tamil.{fmt}")
     os.makedirs(os.path.join(WORK, "tts"), exist_ok=True)
     created = []
+    bgm_job = None
     try:
-        report(5, f"வீடியோ {duration(video)/60:.1f} நிமிடம்: BGM / குரல் பிரிக்குது (நேரம் ஆகலாம்)")
-        bgm = step_bgm(video)
-        report(35, "Gemini பார்த்து பேச்சை எழுதுது")
-        script = step_script(video)
+        report(5, f"வீடியோ {duration(video)/60:.1f} நிமிடம்: BGM பிரிப்பும் Gemini-யும் ஒரே நேரத்தில் ஓடுது")
+        bgm_job = BgmJob(video)
+        bgm_job.start()
+        report(10, "Gemini பார்த்து பேச்சை எழுதுது")
+        script = step_script(video, before_gaps=bgm_job.wait)
+        bgm = bgm_job.wait()
         ls = script["lines"]
         if not ls:
             raise RuntimeError("பேச்சு எதுவும் கண்டுபிடிக்கல. வேற வீடியோ try பண்ணுங்க.")
@@ -1134,6 +1176,11 @@ def dub(video, job_dir, progress=None, fmt="mp4", model=None):
             print(f"  ElevenLabs credits: {remaining} -> {left} (செலவு {remaining - left})")
         report(95, "dub தயார்")
         return OUTPUT_VIDEO
+    except BaseException:
+        if bgm_job and bgm_job.t.is_alive():      # error vandha demucs-um nirkkanum
+            CANCEL.set()
+            bgm_job.t.join(30)
+        raise
     finally:
         if created and not KEEP_VOICES:
             for vid in created:
