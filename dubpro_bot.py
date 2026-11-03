@@ -18,6 +18,11 @@ try:
 except ImportError:
     subprocess.run([sys.executable, "-m", "pip", "install", "-q", "telethon"])
 
+try:
+    import cryptg  # noqa  (Telegram upload/download 3-5x vegam)
+except ImportError:
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "cryptg"], capture_output=True)
+
 from telethon import TelegramClient, events
 from telethon.tl.custom import Button
 
@@ -42,7 +47,29 @@ JOBS = {}          # job_id -> Job
 CURRENT = None     # ippo odittu irukkura Job
 MODES = {"expressive": "eleven_v3", "stable": "eleven_multilingual_v2", "economy": "eleven_flash_v2_5"}
 MODE_TXT = {"expressive": "நடிப்பு (v3)", "stable": "நிலையான (v2)", "economy": "சிக்கனம் (flash, credit பாதி)"}
-SETTINGS = {}      # user_id -> {"fmt": "mp4|mkv", "send": "video|document", "mode": "expressive|stable|economy"}
+CACHE = os.path.join(BASE, "cache")      # script + BGM + kural + TTS (adhe video thirumba vandha vegam)
+os.makedirs(CACHE, exist_ok=True)
+PREFS_FILE = os.path.join(BASE, "prefs.json")
+PENDING = {}       # job_id -> Job (user Start azhuththa kaathirukkuthu)
+LANG_ORDER = ["ta", "te", "ml", "kn", "hi"]
+MODE_BTN = {"expressive": "🎭 நடிப்பு", "stable": "⚖️ நிலையான", "economy": "💰 சிக்கனம்"}
+
+
+def _load_prefs():
+    try:
+        return {int(k): v for k, v in json.load(open(PREFS_FILE, encoding="utf-8")).items()}
+    except Exception:
+        return {}
+
+
+SETTINGS = _load_prefs()      # user_id -> {"fmt","send","mode","langs"}  (restart aanaalum nenaivil irukkum)
+
+
+def save_prefs():
+    try:
+        json.dump(SETTINGS, open(PREFS_FILE, "w", encoding="utf-8"))
+    except Exception:
+        pass
 STOPPING = False
 
 
@@ -84,7 +111,46 @@ async def announce(text):
 
 
 def prefs(uid):
-    return SETTINGS.setdefault(uid, {"fmt": "mp4", "send": "video", "mode": "expressive", "langs": ["ta"]})
+    p = SETTINGS.setdefault(uid, {})
+    for k, v in (("fmt", "mp4"), ("send", "video"), ("mode", "expressive"), ("langs", ["ta"])):
+        p.setdefault(k, list(v) if isinstance(v, list) else v)
+    return p
+
+
+# ----------------------------- BUTTON PANEL ---------------------------------
+def tick(on, txt):
+    return ("✅ " if on else "▫️ ") + txt
+
+
+def panel_text(p, with_video=False):
+    head = "🎬 வீடியோ கிடைத்தது ✅\n" if with_video else "⚙️ அமைப்புகள்\n"
+    tail = "\n\nமொழிகளைத் தொட்டு தேர்ந்தெடுங்க (எத்தனை வேணாலும்), அப்புறம் ▶️ Start அழுத்துங்க." if with_video else \
+        "\n\nமொழி / குரல் / format எல்லாம் பட்டனை தொட்டு மாத்துங்க. வீடியோ அனுப்புனா இதே அமைப்பு எடுத்துக்கும்."
+    return head + describe(p) + tail
+
+
+def panel_buttons(p, jid, fresh=False):
+    B = Button.inline
+    ls = p.get("langs") or ["ta"]
+    multi = len(ls) > 1
+    mkv = p["fmt"] == "mkv" or multi
+    doc = p["send"] == "document" or mkv
+
+    def d(a):
+        return f"S:{jid}:{a}".encode()
+
+    lang_btn = lambda l: B(tick(l in ls, tamil_dub.LANGS[l]["native"]), d("l" + l))  # noqa
+    rows = [
+        [lang_btn(l) for l in LANG_ORDER[:3]],
+        [lang_btn(l) for l in LANG_ORDER[3:]] + [B(tick(len(ls) == len(LANG_ORDER), "அனைத்தும்"), d("A"))],
+        [B(tick(p["mode"] == m, MODE_BTN[m]), d("m" + m)) for m in MODES],
+        [B(tick(not mkv, "MP4"), d("fmp4")), B(tick(mkv, "MKV"), d("fmkv")),
+         B(tick(not doc, "🎞 Video"), d("svideo")), B(tick(doc, "📄 File"), d("sdocument"))],
+    ]
+    if jid != "0":
+        rows.append([B(tick(fresh, "🔄 புது script எழுது"), d("R"))])
+        rows.append([B("▶️ Start", d("G")), B("❌ Cancel", d("X"))])
+    return rows
 
 
 def describe(p):
@@ -104,18 +170,25 @@ def is_video(msg):
 
 
 class Job:
-    def __init__(self, event, fmt, send, mode="expressive", langs=None):
-        self.mode = mode
-        self.langs = langs or ["ta"]
-        if len(self.langs) > 1:          # palamozhi = MKV file (multi-audio)
-            fmt, send = "mkv", "document"
+    def __init__(self, event):
         self.event = event
         self.id = f"{event.sender_id}x{int(time.time() * 1000) % 10 ** 9}"
-        self.fmt, self.send = fmt, send
         self.cancelled = False
         self.msg = None
         self.last_edit = 0.0
         self.last_text = ""
+        self.fresh = False        # True = cache vendaam, script-a mudhalilirundhu ezhuthu
+        self.dl = None            # download task (user mozhi therndhedukkum bodhe download aagum)
+        self.dl_pct = 0.0
+        self.apply(prefs(event.sender_id))
+
+    def apply(self, p):
+        self.mode = p.get("mode", "expressive")
+        self.langs = list(p.get("langs") or ["ta"])
+        fmt, send = p["fmt"], p["send"]
+        if len(self.langs) > 1:          # palamozhi = MKV file (multi-audio)
+            fmt, send = "mkv", "document"
+        self.fmt, self.send = fmt, send
 
     def cancel_button(self):
         return [Button.inline("❌ Cancel", data=f"cancel:{self.id}".encode())]
@@ -148,12 +221,17 @@ async def finish_msg(job, text):
 @client.on(events.NewMessage(pattern="/start"))
 async def start(event):
     remember_user(event.sender_id)
-    await event.reply("வணக்கம்! 🎬 ஒரு வீடியோ அனுப்புங்க. ஒவ்வொரு கேரக்டரோட அசல் குரலையே clone செய்து, பேச்சுத் தமிழில் dub செய்து அனுப்புறேன்.\n"
-                      "(நீளமான வீடியோவுக்கு நேரம் ஆகும். ஒரு நேரத்தில் ஒரு வீடியோ மட்டும்.)\n\n"
-                      "வடிவம்: /mp4 /mkv  |  அனுப்பும் முறை: /video /document\n"
-                      "குரல் நடை: /expressive (நடிப்பு, default)  /stable  /economy\n"
-                      "மொழி: /lang tamil telugu malayalam kannada  (எத்தனை வேணாலும், /lang all = நான்கும்)\n"
-                      "நிலை: /status  |  நிறுத்த: /cancel  |  /settings")
+    p = prefs(event.sender_id)
+    await event.reply("வணக்கம்! 🎬 ஒரு வீடியோ அனுப்புங்க. ஒவ்வொரு கேரக்டரோட அசல் குரலையே clone செய்து dub செய்து அனுப்புறேன்.\n"
+                      "அனுப்பினதும் மொழி (தமிழ் / తెలుగు / മലയാളം / ಕನ್ನಡ / हिन्दी) பட்டன் வரும் — தொட்டு தேர்ந்தெடுத்து ▶️ Start.\n"
+                      "நிலை: /status  |  நிறுத்த: /cancel  |  அமைப்புகள்: /settings\n\n" + panel_text(p),
+                      buttons=panel_buttons(p, "0"))
+
+
+@client.on(events.NewMessage(pattern=r"^/settings"))
+async def settings_cmd(event):
+    p = prefs(event.sender_id)
+    await event.reply(panel_text(p), buttons=panel_buttons(p, "0"))
 
 
 @client.on(events.NewMessage(pattern="/id"))
@@ -161,7 +239,7 @@ async def my_id(event):
     await event.reply(f"உங்க ID: {event.sender_id}")
 
 
-@client.on(events.NewMessage(pattern=r"^/(mp4|mkv|video|document|settings|expressive|stable|economy)"))
+@client.on(events.NewMessage(pattern=r"^/(mp4|mkv|video|document|expressive|stable|economy)"))
 async def set_pref(event):
     cmd = event.raw_text.split()[0].lstrip("/").split("@")[0].lower()
     p = prefs(event.sender_id)
@@ -230,6 +308,64 @@ async def cancel_btn(event):
     await event.answer("Cancel செய்யுது...")
 
 
+@client.on(events.CallbackQuery(pattern=rb"S:(\w+):(\w+)"))
+async def panel_cb(event):
+    jid, act = (g.decode() for g in event.pattern_match.groups())
+    p = prefs(event.sender_id)
+    job = PENDING.get(jid) if jid != "0" else None
+    if jid != "0" and not job:
+        await event.answer("இந்த வீடியோ ஏற்கனவே தொடங்கிடுச்சு.", alert=True)
+        return
+    if job and event.sender_id != job.event.sender_id:
+        await event.answer("இது உங்க வீடியோ இல்ல.", alert=True)
+        return
+    if act == "X":                                   # Cancel (Start-ku munnaadi)
+        PENDING.pop(jid, None)
+        job.cancelled = True
+        if job.dl:
+            job.dl.cancel()
+        JOBS.pop(jid, None)
+        shutil.rmtree(os.path.join(BASE, jid), ignore_errors=True)
+        await event.edit("❌ Cancel ஆனது.", buttons=None)
+        return
+    if act == "G":                                   # ▶️ Start
+        PENDING.pop(jid, None)
+        job.apply(p)
+        pos = queue.qsize() + (1 if CURRENT else 0)
+        await event.edit(f"வரிசையில் இருக்கு ✅ (முன்னாடி {pos})\n"
+                         f"{describe({'fmt': job.fmt, 'send': job.send, 'mode': job.mode, 'langs': job.langs})}",
+                         buttons=job.cancel_button())
+        await queue.put(job)
+        return
+    ls = list(p.get("langs") or ["ta"])
+    if act == "R":
+        job.fresh = not job.fresh
+    elif act == "A":
+        ls = list(LANG_ORDER) if len(ls) < len(LANG_ORDER) else ["ta"]
+    elif act[0] == "l":
+        c = act[1:]
+        if c in ls:
+            if len(ls) > 1:
+                ls.remove(c)
+            else:
+                await event.answer("குறைஞ்சது ஒரு மொழி வேணும்")
+        elif c in LANG_ORDER:
+            ls.append(c)
+    elif act[0] == "m" and act[1:] in MODES:
+        p["mode"] = act[1:]
+    elif act[0] == "f" and act[1:] in ("mp4", "mkv"):
+        p["fmt"] = act[1:]
+    elif act[0] == "s" and act[1:] in ("video", "document"):
+        p["send"] = act[1:]
+    p["langs"] = [l for l in LANG_ORDER if l in ls]
+    save_prefs()
+    try:
+        await event.edit(panel_text(p, bool(job)), buttons=panel_buttons(p, jid, job.fresh if job else False))
+    except Exception:
+        pass
+    await event.answer()
+
+
 # ----------------------------- video handler --------------------------------
 @client.on(events.NewMessage(func=lambda e: e.file is not None))
 async def on_file(event):
@@ -241,20 +377,21 @@ async def on_file(event):
         return
     remember_user(event.sender_id)
     p = prefs(event.sender_id)
-    cap = (event.raw_text or "").lower()        # caption-la 'mkv' / 'doc' ezhuthina adhu mudhal
-    fmt = "mkv" if "mkv" in cap else ("mp4" if "mp4" in cap else p["fmt"])
-    send = "document" if ("doc" in cap or "file" in cap) else p["send"]
-    mode = next((m for m in MODES if m in cap), p.get("mode", "expressive"))
-    words = [t for t in re.split(r"[\s,+/|]+", cap) if t in tamil_dub.LANG_LONG_SET]
-    langs = tamil_dub.parse_langs(words) if words else (p.get("langs") or ["ta"])
-    job = Job(event, fmt, send, mode, langs)
-    fmt, send = job.fmt, job.send
+    job = Job(event)
     JOBS[job.id] = job
-    pos = queue.qsize() + (1 if CURRENT else 0)
-    job.msg = await event.reply(
-        f"வீடியோ கிடைத்தது ✅ வரிசையில் இருக்கு (முன்னாடி {pos})\n{describe({'fmt': fmt, 'send': send, 'mode': mode, 'langs': langs})}",
-        buttons=job.cancel_button())
-    await queue.put(job)
+    PENDING[job.id] = job
+    job.msg = await event.reply(panel_text(p, True), buttons=panel_buttons(p, job.id))
+    job.dl = asyncio.create_task(download_job(job))      # user therndhedukkum bodhe download aagum
+
+
+async def download_job(job):
+    jobdir = os.path.join(BASE, job.id)
+    os.makedirs(jobdir, exist_ok=True)
+
+    def cb(cur, tot):
+        if tot:
+            job.dl_pct = 100.0 * cur / tot
+    return await job.event.download_media(file=os.path.join(jobdir, "input"), progress_callback=cb)
 
 
 async def worker():
@@ -274,21 +411,23 @@ async def worker():
         os.makedirs(jobdir, exist_ok=True)
         try:
             await update(job, 1, "பதிவிறக்குது", force=True)
-
-            def dl_cb(cur, tot):
-                if tot:
-                    asyncio.ensure_future(update(job, 1 + 3 * cur / tot, "பதிவிறக்குது"))
-
-            src = await event.download_media(file=os.path.join(jobdir, "input"), progress_callback=dl_cb)
+            while not job.dl.done():
+                await update(job, 1 + 3 * job.dl_pct / 100, "பதிவிறக்குது")
+                await asyncio.sleep(2)
+            src = job.dl.result()
             if job.cancelled:
                 raise tamil_dub.Cancelled()
+            cdir = os.path.join(CACHE, tamil_dub.cache_key(src))
+            if job.fresh:
+                shutil.rmtree(cdir, ignore_errors=True)
+            os.makedirs(cdir, exist_ok=True)
 
             def progress(pct, text):
                 asyncio.run_coroutine_threadsafe(update(job, pct, text), loop)
 
             def run_job():
                 try:
-                    return "ok", tamil_dub.dub(src, jobdir, progress, job.fmt, MODES[job.mode], job.langs)
+                    return "ok", tamil_dub.dub(src, jobdir, progress, job.fmt, MODES[job.mode], job.langs, cache_dir=cdir)
                 except tamil_dub.Cancelled:
                     return "cancelled", None
 
@@ -321,7 +460,8 @@ async def worker():
         finally:
             CURRENT = None
             JOBS.pop(job.id, None)
-            shutil.rmtree(jobdir, ignore_errors=True)
+            shutil.rmtree(jobdir, ignore_errors=True)      # cache folder-a thodaadhu (adhu thaan vegam)
+            tamil_dub.prune_cache(CACHE, 3)
             queue.task_done()
 
 
