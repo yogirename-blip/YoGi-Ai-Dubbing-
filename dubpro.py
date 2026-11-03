@@ -8,7 +8,7 @@ Video -> BGM/kural pirippu (demucs) -> Gemini: yaar enna pesuranga + movie-dub p
 Secrets: GEMINI_API_KEY, ELEVENLABS_API_KEY
 """
 
-import os, sys, re, json, time, glob, shutil, subprocess, wave, uuid, threading, signal
+import os, sys, re, json, time, glob, shutil, subprocess, wave, uuid, threading, signal, hashlib
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import envload  # noqa  (.env padikkum, Windows UTF-8)
 from types import SimpleNamespace as _NS
@@ -27,7 +27,7 @@ TTS_FALLBACK = "gemini-3.8-flash-lite-tts"
 CHUNK_MIN    = 8         # video-va ivlo nimisham thundaa pirichu anuppum
 PROXY_HEIGHT = 480       # Gemini-ku anuppa chinna video (upload vegam)
 MAX_SPEEDUP  = 1.35      # Tamil vari neelamaa irundha max vegappaduthal
-TTS_WORKERS  = int(os.environ.get("TTS_WORKERS", "3"))   # 429 niraya vandha .env-la TTS_WORKERS=2 (illa 1) vainga
+TTS_WORKERS  = int(os.environ.get("TTS_WORKERS", "4"))   # 429 niraya vandha .env-la TTS_WORKERS=2 (illa 1) vainga
 
 # ---- ElevenLabs
 ELEVEN_MODEL = os.environ.get("ELEVEN_MODEL", "eleven_v3")   # v3 = acting/emotion (audio tags). Stable: eleven_multilingual_v2
@@ -196,6 +196,15 @@ def find_video():
 
 
 # ----------------------------- STEP 1: BGM ----------------------------------
+def _device():
+    """GPU irundha demucs-a adhula odum (10x vegam). Illa na cpu."""
+    try:
+        import torch
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        return "cpu"
+
+
 def step_bgm(video):
     bgm_path = os.path.join(WORK, "bgm.wav")
     if os.path.exists(bgm_path):
@@ -205,7 +214,7 @@ def step_bgm(video):
     full = os.path.join(WORK, "full_audio.wav")
     sh(f'ffmpeg -y -i "{video}" -vn -ac 2 -ar 44100 "{full}"')
     extra = os.environ.get("DEMUCS_EXTRA", "")      # e.g. "-j 2" (experiment)
-    r = sh(f'"{sys.executable}" -m demucs --two-stems=vocals -n htdemucs -d cpu --overlap 0.1 {extra} '
+    r = sh(f'"{sys.executable}" -m demucs --two-stems=vocals -n htdemucs -d {_device()} --overlap 0.1 {extra} '
            f'-o "{WORK}/demucs" "{full}"', check=False)
     hits = glob.glob(os.path.join(WORK, "demucs", "**", "no_vocals.wav"), recursive=True)
     if r.returncode == 0 and hits:
@@ -213,6 +222,11 @@ def step_bgm(video):
         voc = glob.glob(os.path.join(WORK, "demucs", "**", "vocals.wav"), recursive=True)
         if voc:
             shutil.copy(voc[0], os.path.join(WORK, "vocals.wav"))
+            try:
+                os.remove(full)        # vocals.wav irukku -> full_audio thevai illa (disk migum)
+            except Exception:
+                pass
+        shutil.rmtree(os.path.join(WORK, "demucs"), ignore_errors=True)
     else:
         print("  !! demucs fail aachu. Fallback: asal audio-va romba kuraichu BGM-aa "
               "use pannuvom (asal kural mella kekkum).")
@@ -420,7 +434,7 @@ def speech_mask(vocals_path):
     return np.convolve(dil.astype(int), np.ones(9), "same") >= 9
 
 
-def find_gaps(mask, lines, min_gap=1.0):
+def find_gaps(mask, lines, min_gap=0.7):
     """Kural kekkuthu aana script-la illatha idangal."""
     n = len(mask)
     covered = np.zeros(n, dtype=bool)
@@ -541,6 +555,7 @@ def step_script(video, before_gaps=None):
     script_path = os.path.join(WORK, "script.json")
     if os.path.exists(script_path):
         print("[2] script.json cache irukku, skip")
+        report(54, "✅ script ஏற்கனவே இருக்கு — மறுபடி எழுதல (வேகம்)")
         return json.load(open(script_path, encoding="utf-8"))
 
     print("[2] Gemini-ku video anuppi script eluthurom...")
@@ -553,9 +568,12 @@ def step_script(video, before_gaps=None):
         off = i * step
         clip = os.path.join(WORK, f"chunk_{i}.mp4")
         report(36 + 18 * i / n, f"Gemini பேச்சை எழுதுது ({i+1}/{n})")
-        cut_clip(proxy, off, step, clip)
+        cs = max(0.0, off - 3.0)                       # 3s overlap: chunk nadula pechu vettu padaama
+        cut_clip(proxy, cs, min(step, total - off) + (off - cs) + 3.0, clip)
         print(f"  chunk {i+1}/{n} ({off/60:.0f} min-la irundhu)")
-        lines += run_clip(clip, off, chars)
+        for nl in run_clip(clip, cs, chars):
+            if off - 0.01 <= nl["start"] < off + step:  # start-a vaichu yaar-ku sondham-nu mudivu
+                lines.append(nl)
 
     lines.sort(key=lambda x: x["start"])
     if before_gaps:
@@ -569,6 +587,11 @@ def step_script(video, before_gaps=None):
     polish(lines, chars)
     out = {"characters": chars, "lines": lines}
     json.dump(out, open(script_path, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+    for f_ in glob.glob(os.path.join(WORK, "chunk_*.mp4")) + glob.glob(os.path.join(WORK, "gap_*.mp4")):
+        try:
+            os.remove(f_)
+        except Exception:
+            pass
     print(f"  {len(lines)} varigal, {len(chars)} characters")
     return out
 
@@ -583,11 +606,14 @@ LANGS = {
            "style": "casual everyday spoken Malayalam exactly like Malayalam-dubbed movies, never bookish or formal Malayalam"},
     "kn": {"name": "Kannada", "native": "ಕನ್ನಡ", "iso3": "kan", "cps": 13.0, "block": (0x0C80, 0x0CFF),
            "style": "casual everyday spoken Kannada exactly like Kannada-dubbed movies, never bookish or formal Kannada"},
+    "hi": {"name": "Hindi", "native": "हिन्दी", "iso3": "hin", "cps": 14.0, "block": (0x0900, 0x097F),
+           "style": "casual everyday spoken Hindi (bolchaal ki Hindi) exactly like Hindi-dubbed movies, never shuddh/Sanskritised or formal Hindi"},
 }
 LANG_LONG = {"tamil": "ta", "தமிழ்": "ta", "telugu": "te", "தெலுங்கு": "te", "తెలుగు": "te",
-             "malayalam": "ml", "மலையாளம்": "ml", "മലയാളം": "ml", "kannada": "kn", "கன்னடம்": "kn", "ಕನ್ನಡ": "kn"}
+             "malayalam": "ml", "மலையாளம்": "ml", "മലയാളം": "ml", "kannada": "kn", "கன்னடம்": "kn", "ಕನ್ನಡ": "kn",
+             "hindi": "hi", "ஹிந்தி": "hi", "இந்தி": "hi", "हिन्दी": "hi", "हिंदी": "hi"}
 LANG_WORDS = dict(LANG_LONG, **{"ta": "ta", "tam": "ta", "te": "te", "tel": "te", "ml": "ml", "mal": "ml",
-                                "kn": "kn", "kan": "kn"})
+                                "kn": "kn", "kan": "kn", "hi": "hi", "hin": "hi"})
 ALL_WORDS = {"all", "alllang", "அனைத்தும்", "எல்லாம்"}
 LANG_LONG_SET = set(LANG_LONG) | ALL_WORDS
 NOTES = []          # user-ku sollanum-nu irukkura echcharikkaigal (bot caption-la kaattum)
@@ -629,7 +655,7 @@ Write every line in {lang} so it sounds like a real person ACTING and TALKING in
 
 Language style (VERY IMPORTANT): {style}.
 Write ONLY in {lang} ({native}) script. Common loanwords (OK, sorry, thanks, phone) may be written in {native} script.
-No Hindi, no Tamil, no English sentences.
+No other language and no English sentences.
 - Translate from the ORIGINAL words ("en"). The "ta" field is only a Tamil adaptation to help with meaning; never copy it.
 - Natural speech with the contractions, reactions and interjections real {lang} speakers use. Copy the rhythm and emotion
   of the original: short exclamations stay short, keep repeated words, stutters, interruptions ("—") and trailing off ("...").
@@ -649,26 +675,34 @@ INPUT:
 
 
 def step_translate(script, langs, base_pct=58, span=8):
-    """Tamil-ai thavira matra mozhigalukku (te/ml/kn) asal pechilirundhu dub-style varigal ezhuthum. script.json-la save aagum."""
+    """Tamil-ai thavira matra mozhigalukku (te/ml/kn/hi) asal pechilirundhu dub-style varigal ezhuthum.
+    Mozhigal ellaam SERNDHU (parallel) odum. script.json-la save aagum -> adutha murai thirumba ezhutha vendaam."""
     chars, lines = script["characters"], script["lines"]
     todo = [l for l in langs if l != "ta"]
-    changed = False
-    for li, lang in enumerate(todo):
+    if not todo:
+        return
+    lock = threading.Lock()
+    done_n = [0]
+
+    def missing(lang):
+        return [k for k, ln in enumerate(lines) if not (ln.get("t") or {}).get(lang)]
+
+    def one(lang):
         info = LANGS[lang]
-        need = [k for k, ln in enumerate(lines) if not (ln.get("t") or {}).get(lang)]
-        if not need:
-            print(f"  {info['name']} cache irukku, skip")
-            continue
-        print(f"  {info['name']} varigal ezhuthurom ({len(need)} varigal)...")
+        if not missing(lang):
+            print(f"  {info['native']} cache irukku, skip")
+            return False
+        print(f"  {info['name']} varigal ezhuthurom ({len(missing(lang))} varigal)...")
         fails = 0
-        for rnd in range(3):
-            if not need or fails >= 2:
+        for rnd in range(4):          # ovvoru round-um neelam vidhi-ya konjam thalarthum -> oru vari kooda vidupadaadhu
+            need = missing(lang)
+            if not need or fails >= 3:
                 break
-            for i in range(0, len(need), 30):
+            slack = (1.4, 2.0, 3.0, 99.0)[rnd]
+            B = 30 if rnd == 0 else 10
+            for i in range(0, len(need), B):
                 check_cancel()
-                report(base_pct + span * (li + i / max(1, len(need))) / len(todo),
-                       f"{info['native']} வரிகள் எழுதுது")
-                idxs = need[i: i + 30]
+                idxs = need[i: i + B]
                 items = []
                 for j, k in enumerate(idxs):
                     ln = lines[k]
@@ -687,17 +721,25 @@ def step_translate(script, langs, base_pct=58, span=8):
                         j = int(it["id"])
                         t = clean_tags(str(it.get("text", "")).strip())
                         if 0 <= j < len(idxs) and native_ok(t, lang) and \
-                                len(strip_tags(t)) <= items[j]["max_chars"] * 1.4 + 6:
-                            lines[idxs[j]].setdefault("t", {})[lang] = t
-                            changed = True
+                                len(strip_tags(t)) <= items[j]["max_chars"] * slack + 6:
+                            with lock:
+                                lines[idxs[j]].setdefault("t", {})[lang] = t
                 except Exception as e:  # noqa
                     fails += 1
                     print(f"  {lang} translate fail: {str(e)[:150]}")
-                    if fails >= 2:
+                    if fails >= 3:
                         break
-            need = [k for k, ln in enumerate(lines) if not (ln.get("t") or {}).get(lang)]
-        if need:
-            NOTES.append(f"{info['native']}: {len(need)}/{len(lines)} வரி எழுத முடியல (அந்த இடங்கள் அமைதியா இருக்கும்)")
+        left = missing(lang)
+        if left:
+            NOTES.append(f"{info['native']}: {len(left)}/{len(lines)} வரி எழுத முடியல (அந்த இடங்கள் அமைதியா இருக்கும்)")
+        with lock:
+            done_n[0] += 1
+            report(base_pct + span * done_n[0] / len(todo), f"{info['native']} வரிகள் தயார்")
+        return True
+
+    report(base_pct, "மொழி வரிகள் எழுதுது (எல்லா மொழியும் ஒரே நேரத்தில்)")
+    with ThreadPoolExecutor(max_workers=min(3, len(todo))) as ex:
+        changed = any(ex.map(one, todo))
     if changed:
         try:
             json.dump(script, open(os.path.join(WORK, "script.json"), "w", encoding="utf-8"),
@@ -737,7 +779,7 @@ def el_req(method, path, what, **kw):
 
 def credit_mult(lang="ta"):
     m = EL_STATE["model"]
-    return 0.5 if (lang == "ta" and ("flash" in m or "turbo" in m)) else 1.0
+    return 0.5 if (lang in ("ta", "hi") and ("flash" in m or "turbo" in m)) else 1.0
 
 
 def el_credits():
@@ -788,7 +830,14 @@ def cut_pcm(src, start, dur):
     return np.frombuffer(r.stdout, dtype=np.int16)
 
 
-def build_sample(cid, lines, src, out_path):
+def load_pcm(src):
+    """Audio-va oru thadavai mattum decode (44.1k mono). Appuram numpy-la thundu edukkalaam (ffmpeg per line illa)."""
+    r = subprocess.run(["ffmpeg", "-v", "error", "-i", src, "-ac", "1", "-ar", "44100", "-f", "s16le", "-"],
+                       capture_output=True)
+    return np.frombuffer(r.stdout, dtype=np.int16)
+
+
+def build_sample(cid, lines, pcm, out_path):
     """Oru character-oda thelivaana pechu thundugalai serthu clone sample-aakkum. Seconds-a thirumbum."""
     mine = [l for l in lines if l["speaker"] == cid]
     others = [l for l in lines if l["speaker"] != cid]
@@ -821,7 +870,8 @@ def build_sample(cid, lines, src, out_path):
     gap = np.zeros(int(0.25 * 44100), dtype=np.int16)
     parts = []
     for l in sorted(chosen, key=lambda x: x["start"]):
-        x = cut_pcm(src, l["start"] + 0.03, (l["end"] - l["start"]) - 0.06)
+        a0 = int(max(0.0, l["start"] + 0.03) * 44100)
+        x = pcm[a0: a0 + int(((l["end"] - l["start"]) - 0.06) * 44100)]
         if len(x) > 4410:
             parts += [x, gap]
     if not parts:
@@ -865,33 +915,53 @@ def premade_voice(c, used):
 
 
 def step_voices(script):
-    """Ovvoru character-ku asal kural clone (illa na premade). (voices, info, created) tharum."""
+    """Ovvoru character-ku asal kural clone (illa na premade). Clone-gal SERNDHU (parallel). (voices, info, created) tharum."""
     chars, lines = script["characters"], script["lines"]
     voc = os.path.join(WORK, "vocals.wav")
     has_voc = os.path.exists(voc)
     src = voc if has_voc else os.path.join(WORK, "full_audio.wav")
     talk = {cid: sum(l["end"] - l["start"] for l in lines if l["speaker"] == cid) for cid in chars}
     order = sorted(chars, key=lambda c: -talk.get(c, 0))
-    voices, info, created, used, n_clone = {}, {}, [], set(), 0
-    for k, cid in enumerate(order):
+    pcm = load_pcm(src) if os.path.exists(src) else None
+    info, created, lock, n_clone = {}, [], threading.Lock(), [0]
+    got = {}
+
+    def do(cid):
         check_cancel()
-        report(61 + 5 * k / max(1, len(order)), f"கேரக்டர் குரல் clone ({k+1}/{len(order)})")
-        vid = None
-        if n_clone < MAX_CLONES and talk.get(cid, 0) >= 1.0 and os.path.exists(src):
-            sample = os.path.join(WORK, f"sample_{cid}.mp3")
-            try:
-                dur = build_sample(cid, lines, src, sample)
-                if dur >= MIN_SAMPLE_S:
-                    sp = sample if os.path.exists(sample) else sample.replace(".mp3", ".wav")
-                    vid = clone_voice(cid, sp, remove_bg=not has_voc)
+        if pcm is None or talk.get(cid, 0) < 1.0:
+            return
+        with lock:
+            if n_clone[0] >= MAX_CLONES:
+                return
+            n_clone[0] += 1                       # idam othukkiduvom
+        ok = False
+        sample = os.path.join(WORK, f"sample_{cid}.mp3")
+        try:
+            dur = build_sample(cid, lines, pcm, sample)
+            if dur >= MIN_SAMPLE_S:
+                sp = sample if os.path.exists(sample) else sample.replace(".mp3", ".wav")
+                vid = clone_voice(cid, sp, remove_bg=not has_voc)
+                with lock:
                     created.append(vid)
-                    n_clone += 1
+                    got[cid] = vid
                     info[cid] = f"clone ({dur:.0f}s)"
-                else:
-                    info[cid] = f"sample kammi ({dur:.0f}s)"
-            except Exception as e:  # noqa
-                print(f"  {cid} clone fail: {str(e)[:200]}")
-                info[cid] = "clone fail"
+                ok = True
+            else:
+                info[cid] = f"sample kammi ({dur:.0f}s)"
+        except Exception as e:  # noqa
+            print(f"  {cid} clone fail: {str(e)[:200]}")
+            info[cid] = "clone fail"
+        if not ok:
+            with lock:
+                n_clone[0] -= 1                   # fail aana idam thirumba kidaikkum
+
+    report(61, f"கேரக்டர் குரல்கள் clone ஆகுது (0/{len(order)})")
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        for k, _ in enumerate(ex.map(do, order)):
+            report(61 + 5 * (k + 1) / max(1, len(order)), f"கேரக்டர் குரல் clone ({k+1}/{len(order)})")
+    voices, used = {}, set()
+    for cid in order:
+        vid = got.get(cid)
         if not vid:
             vid = premade_voice(chars[cid], used)
             info[cid] = info.get(cid, "") + " -> premade"
@@ -913,8 +983,8 @@ def is_expressive(m):
 
 def el_tts(text, voice_id, emotion, prev_text=None, next_text=None, lang="ta"):
     m = EL_STATE["model"]
-    if lang != "ta" and not is_expressive(m):
-        m = "eleven_v3"          # Telugu / Malayalam / Kannada-ku v3 thaan venum (v2/flash aadharikkaadhu)
+    if lang in ("te", "ml", "kn") and not is_expressive(m):
+        m = "eleven_v3"          # Telugu / Malayalam / Kannada-ku v3 thaan venum (Tamil, Hindi-ku ellaa model-um okay)
     expr = is_expressive(m)
     if expr:     # v3/v4: audio tag-a nadippaanga; stability = Creative(0) / Natural(0.5)
         hot = emotion in ("angry", "shout", "scared", "happy")
@@ -1241,7 +1311,7 @@ def step_tts(script, voices, lang="ta", base_pct=67, span=25):
     def missing():
         return [i for i in range(len(lines)) if not os.path.exists(os.path.join(tdir, f"{i:05d}.wav"))]
 
-    for rnd in range(2):
+    for rnd in range(3):
         failed = missing()
         if not failed or STATS.get("gem_dead") and EL_STATE["dead"]:
             break
@@ -1307,11 +1377,38 @@ def step_mix(video, bgm, lines, audios_by_lang, langs):
     r = sh(build(True), check=False)
     if r.returncode != 0:  # pazhaya ffmpeg-la normalize illa
         sh(build(False))
+    for t in tracks:                       # periya temp wav-gal neekku (cache-la thevai illa)
+        try:
+            os.remove(t)
+        except Exception:
+            pass
     print(f"\nMudinjadhu -> {OUTPUT_VIDEO}")
 
 
+# ----------------------------- CACHE ----------------------------------------
+def cache_key(path):
+    """Video-oda adaiyaalam (size + 3 idathula 2MB). Adhe video thirumba vandha script/BGM/kural cache payanpadum."""
+    h = hashlib.sha1(str(os.path.getsize(path)).encode())
+    size = os.path.getsize(path)
+    with open(path, "rb") as f:
+        for pos in (0, max(0, size // 2 - 1_000_000), max(0, size - 2_000_000)):
+            f.seek(pos)
+            h.update(f.read(2_000_000))
+    return h.hexdigest()[:16]
+
+
+def prune_cache(root, keep=3):
+    """Kadaisi 'keep' videos-oda cache mattum vachukkum (disk nirambaama)."""
+    try:
+        ds = sorted((os.path.join(root, d) for d in os.listdir(root)), key=os.path.getmtime, reverse=True)
+        for d in ds[keep:]:
+            shutil.rmtree(d, ignore_errors=True)
+    except Exception:
+        pass
+
+
 # ----------------------------- MAIN -----------------------------------------
-def dub(video, job_dir, progress=None, fmt="mp4", model=None, langs=None):
+def dub(video, job_dir, progress=None, fmt="mp4", model=None, langs=None, cache_dir=None):
     """Video-va (asal kural clone-oda) dub panni output path-a tharum.
     langs: ["ta","te","ml","kn"] (ethaiyum serkkalam). Onnukku mela na MKV-la multi-audio."""
     global WORK, OUTPUT_VIDEO, _PROG
@@ -1321,11 +1418,15 @@ def dub(video, job_dir, progress=None, fmt="mp4", model=None, langs=None):
     EL_STATE["model"] = model or ELEVEN_MODEL
     EL_STATE["dead"] = False
     STATS["gem_dead"], STATS["last_err"] = False, ""
-    WORK = os.path.join(job_dir, "work")
+    WORK = cache_dir or os.path.join(job_dir, "work")     # cache_dir = script/BGM/kural thangum (adutha mozhikku reuse)
     fmt = "mkv" if (str(fmt).lower() == "mkv" or len(langs) > 1) else "mp4"
     OUTPUT_VIDEO = os.path.join(job_dir, f"dubbed_{'_'.join(langs)}.{fmt}")
     os.makedirs(os.path.join(WORK, "tts"), exist_ok=True)
-    if any(l != "ta" for l in langs) and not is_expressive(EL_STATE["model"]):
+    try:
+        os.utime(WORK, None)
+    except Exception:
+        pass
+    if any(l in ("te", "ml", "kn") for l in langs) and not is_expressive(EL_STATE["model"]):
         NOTES.append("தெலுங்கு/மலையாளம்/கன்னடத்துக்கு ElevenLabs v3 மட்டும்தான் வேலை செய்யும், அதனால் அவற்றுக்கு v3 பயன்படுத்தினேன்")
     created = []
     bgm_job = None
