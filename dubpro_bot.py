@@ -41,7 +41,8 @@ os.makedirs(BASE, exist_ok=True)
 START = time.time()
 USERS_FILE = os.path.join(BASE, "users.json")
 
-client = TelegramClient(os.path.join(BASE, "bot_session"), API_ID, API_HASH)
+client = TelegramClient(os.path.join(BASE, "bot_session"), API_ID, API_HASH,
+                        connection_retries=None, retry_delay=5, auto_reconnect=True, timeout=30)
 queue: asyncio.Queue = asyncio.Queue()
 JOBS = {}          # job_id -> Job
 CURRENT = None     # ippo odittu irukkura Job
@@ -384,14 +385,47 @@ async def on_file(event):
     job.dl = asyncio.create_task(download_job(job))      # user therndhedukkum bodhe download aagum
 
 
+async def fast_download(job, path, conns=8, part=8 * 1024 * 1024, rs=512 * 1024):
+    """Periya file-a pala thundaa (8 ore neram) download - normal download-ai vida 4-8x vegam."""
+    media, size = job.event.message.media, job.event.file.size
+    with open(path, "wb") as f:
+        f.truncate(size)
+    got = [0]
+    sem = asyncio.Semaphore(conns)
+
+    async def grab(off):
+        async with sem:
+            pos = off
+            lim = (min(part, size - off) + rs - 1) // rs
+            with open(path, "r+b") as f:
+                async for chunk in job.event.client.iter_download(
+                        media, offset=off, limit=lim, request_size=rs, file_size=size):
+                    f.seek(pos)
+                    f.write(chunk)
+                    pos += len(chunk)
+                    got[0] += len(chunk)
+                    job.dl_pct = 100.0 * got[0] / size
+
+    await asyncio.gather(*(grab(o) for o in range(0, size, part)))
+    return path
+
+
 async def download_job(job):
     jobdir = os.path.join(BASE, job.id)
     os.makedirs(jobdir, exist_ok=True)
+    try:
+        ext = job.event.file.ext or ".mp4"
+        return await fast_download(job, os.path.join(jobdir, "input" + ext))
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:  # noqa
+        print("fast download fail, normal download-ku maarrom:", str(e)[:150])
+        job.dl_pct = 0.0
 
-    def cb(cur, tot):
-        if tot:
-            job.dl_pct = 100.0 * cur / tot
-    return await job.event.download_media(file=os.path.join(jobdir, "input"), progress_callback=cb)
+        def cb(cur, tot):
+            if tot:
+                job.dl_pct = 100.0 * cur / tot
+        return await job.event.download_media(file=os.path.join(jobdir, "input"), progress_callback=cb)
 
 
 async def worker():
