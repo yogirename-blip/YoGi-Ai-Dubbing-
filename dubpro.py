@@ -131,7 +131,8 @@ def get_api_key():
         return k
 
 
-client = genai.Client(api_key=get_api_key())
+client = genai.Client(api_key=get_api_key(),
+                      http_options=types.HttpOptions(timeout=int(os.environ.get("GEMINI_TIMEOUT_S", "300")) * 1000))
 os.makedirs(WORK, exist_ok=True)
 os.makedirs(os.path.join(WORK, "tts"), exist_ok=True)
 
@@ -258,6 +259,16 @@ class BgmJob:
         return self.result
 
 
+def _wait_bgm(job):
+    """demucs mudiyura varai kaathirukkum; appo appo progress text maathum (bot 'nindruduchu'nu thonaadhu)."""
+    t0 = time.time()
+    while job.t.is_alive():
+        check_cancel()
+        report(54, f"குரல்/BGM பிரிப்பு நடக்குது ({int((time.time() - t0) / 60)} நிமிடம்) — பொறுங்க")
+        job.t.join(5)
+    return job.wait()
+
+
 # ----------------------------- STEP 2: Gemini script ------------------------
 SCRIPT_PROMPT = """You are a professional dubbing scriptwriter for Tamil movies and web series. Watch and listen to this video clip.
 
@@ -373,7 +384,11 @@ def make_proxy(video):
 
 def upload_wait(path):
     f = retry(lambda: client.files.upload(file=path), what="upload")
+    t0 = time.time()
     while getattr(f.state, "name", str(f.state)) == "PROCESSING":
+        check_cancel()
+        if time.time() - t0 > 600:
+            raise RuntimeError("Gemini upload 10 nimishama PROCESSING-la nikkudhu, thirumba try pannunga")
         time.sleep(4)
         f = client.files.get(name=f.name)
     if getattr(f.state, "name", str(f.state)) != "ACTIVE":
@@ -1247,7 +1262,7 @@ def step_tts(script, voices, lang="ta", base_pct=67, span=25):
     print(f"[4] {len(lines)} varigalukku {info['name']} kural ({EL_STATE['model']})...")
     silent = lambda: np.zeros(int(0.1 * SR), dtype=np.float32)  # noqa
 
-    def work(i):
+    def _work(i):
         check_cancel()
         ln = lines[i]
         path = os.path.join(tdir, f"{i:05d}.wav")
@@ -1318,6 +1333,14 @@ def step_tts(script, voices, lang="ta", base_pct=67, span=25):
         write_wav(path, audio)
         return i, audio
 
+    def work(i):
+        try:
+            return _work(i)
+        except Exception as e:  # noqa   (Cancelled BaseException -> idhai pidikkaadhu)
+            print(f"  line {i} ethirpaaraadha pizhai: {str(e)[:150]}")
+            STATS["last_err"] = str(e)[:200]
+            return i, silent()
+
     results = {}
     with ThreadPoolExecutor(max_workers=TTS_WORKERS) as ex:
         for k, (i, a_) in enumerate(ex.map(work, range(len(lines)))):
@@ -1351,7 +1374,7 @@ def step_mix(video, bgm, lines, audios_by_lang, langs):
     total = duration(video)
     tracks = []
     voc_p = os.path.join(WORK, "vocals.wav")
-    ref = load_pcm(voc_p).astype(np.float32) / 32768.0 if os.path.exists(voc_p) else None
+    ref = load_pcm(voc_p) if os.path.exists(voc_p) else None      # int16 (memory paadhi)
 
     def active_rms(x, thr=0.02):
         v = x[np.abs(x) > thr]
@@ -1361,7 +1384,7 @@ def step_mix(video, bgm, lines, audios_by_lang, langs):
         """Dub vari-yoda sathatham asal vari-yoda sathatham-ku samam (kathal = kathal, mella = mella)."""
         if ref is None:
             return a
-        o = ref[int(ln["start"] * 44100): int(ln["end"] * 44100)]
+        o = ref[int(ln["start"] * 44100): int(ln["end"] * 44100)].astype(np.float32) / 32768.0
         ro, rd = active_rms(o), active_rms(a)
         if ro <= 0 or rd <= 0:
             return a
@@ -1475,7 +1498,7 @@ def dub(video, job_dir, progress=None, fmt="mp4", model=None, langs=None, cache_
         bgm_job = BgmJob(video)
         bgm_job.start()
         report(10, "Gemini பார்த்து பேச்சை எழுதுது")
-        script = step_script(video, before_gaps=bgm_job.wait)
+        script = step_script(video, before_gaps=lambda: _wait_bgm(bgm_job))
         bgm = bgm_job.wait()
         ls = script["lines"]
         if not ls:
