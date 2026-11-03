@@ -28,7 +28,7 @@ MAX_SPEEDUP  = 1.35      # Tamil vari neelamaa irundha max vegappaduthal
 TTS_WORKERS  = 2         # ElevenLabs Starter-ku concurrency kuraivu; 429 vandha 1 aakkunga
 
 # ---- ElevenLabs
-ELEVEN_MODEL = os.environ.get("ELEVEN_MODEL", "eleven_multilingual_v2")   # Tamil support, nalla quality
+ELEVEN_MODEL = os.environ.get("ELEVEN_MODEL", "eleven_v3")   # v3 = acting/emotion (audio tags). Stable: eleven_multilingual_v2
 MAX_CLONES   = int(os.environ.get("MAX_CLONES", "8"))     # evlo character-ku kural clone (voice slot limit-ku)
 KEEP_VOICES  = os.environ.get("KEEP_VOICES", "0") == "1"  # 1 na clone voices-a delete pannaadhu
 MIN_SAMPLE_S = 6.0       # idhukku kuraivaana sample na clone panna maatom (premade voice use aagum)
@@ -237,26 +237,37 @@ Return ONLY JSON:
                    "is_new": true}} ],
  "lines": [ {{"start":"00:01.2","end":"00:03.9","speaker":"C1",
               "original":"original words","tamil":"colloquial Tamil",
-              "emotion":"neutral|angry|sad|happy|scared|whisper|shout|calm"}} ]
+              "emotion":"neutral|angry|sad|happy|scared|whisper|shout|calm",
+              "event":"none|laughs|sighs|gasps|cries|screams|breath"}} ]
 }}
 Only list characters that appear in this clip in "characters"."""
 
 
-POLISH_PROMPT = """You are the top dialogue writer for Tamil-dubbed movies and web series (the kind of dub
-people watch on TV/OTT). Rewrite the Tamil of every line below so it sounds like REAL spoken Tamil as people
-talk in Chennai, as in a professional movie dub. NOT written / formal / literary Tamil.
+POLISH_PROMPT = """You are the director and dialogue writer of a professional Tamil dub (the kind you hear in
+Tamil-dubbed Hollywood films, anime and web series). Below is a conversation, line by line, IN ORDER.
+Rewrite each line so it sounds like a real person ACTING and TALKING in the moment, never like text read aloud.
 
-Rules:
-- Spoken forms: இருக்கிறது->இருக்கு, செய்கிறேன்->பண்றேன்/செய்றேன், சொல்கிறாய்->சொல்ற, வருகிறேன்->வரேன்,
-  போகிறேன்->போறேன், இல்லை->இல்ல, வேண்டும்->வேணும், ஆனால்->ஆனா, அதனால்->அதனால, நீங்கள்->நீங்க,
-  அவர்கள்->அவங்க, என்னுடைய->என்னோட, எப்படி இருக்கிறாய்->எப்படி இருக்க, பிறகு->அப்புறம்.
-- Never use: மற்றும், ஏனெனில், எனவே, ஆகையால், அவ்வாறு.
-- Match the speaker: young/angry male can say டா, வாடா, போடா; polite or elder-facing speech uses நீங்க, சார்,
-  -ங்க; kids and women talk naturally for their age. Use fillers (சரி, ஆமா, அய்யோ, ஹே) only when they fit the emotion.
-- Keep the meaning and emotion of the original, keep length about the same (it must fit the same time).
-- Write only Tamil script (loanwords like ஓகே, சாரி, போன் are fine). No explanations.
+How real dub dialogue sounds:
+- Spoken Chennai Tamil with contractions: இருக்கிறது->இருக்கு, பண்றேன், சொல்ற, வரேன், போறேன், இல்ல, வேணும்,
+  ஆனா, நீங்க, அவங்க, என்னோட, அப்புறம். Never literary Tamil. Never: மற்றும், ஏனெனில், எனவே, ஆகையால்.
+- Natural speech, NOT complete written sentences: drop pronouns when obvious ("நீ வர்றியா?" -> "வர்றியா?"),
+  open with reactions (ஏய், டேய், அட, ஐயோ, ச்சே, ம்ம், ஹா, என்னது?) and use endings like டா, ல, பா, மா, பாரு,
+  சரி only where that character would say them.
+- Copy the rhythm and emotion of the ORIGINAL line: short exclamations stay short, keep repeated words, stutters,
+  interruptions ("—") and trailing off ("..."). Use ? ! ... and commas to place the pauses and pushes exactly where
+  an actor would.
+- Adapt like professional dubbing, not word-by-word: "Oh my god" -> "அய்யோ கடவுளே", "What the hell?" -> "என்னடா இது?",
+  "Come on!" -> "வாடா சீக்கிரம்!", "Thank you" -> "தேங்க்ஸ்", "I'm sorry" -> "சாரி", "Are you kidding me?" -> "விளையாடுறியா?".
+- Use the conversation to choose how people address each other (நீ/நீங்க, டா/டி, சார், அண்ணா, அக்கா, அம்மா...).
+  Keep the same address style for the same pair of people throughout.
+- HARD LIMIT: every line has max_chars (what fits the original timing). Stay at or below it.
+- Audio tags: add at most two English tags in square brackets for the voice actor, only when the original really
+  has it: [angry] [shouting] [whispers] [sad] [crying] [scared] [excited] [nervous] [sarcastic] [sighs] [laughs]
+  [chuckles] [gasps] [breathes] [exhales]. A delivery tag goes at the start of the line, an event tag
+  (laughs/sighs/gasps) where it happens. Use the given emotion and event. Plain neutral lines get no tag.
+- Tamil script only (loanwords like ஓகே, சாரி are fine). Never explain anything.
 
-Input is JSON: each item has id, who, emotion, en (original words), ta (current Tamil).
+Input JSON items: id, who, emotion, event, en (original words), ta (current Tamil), max_chars.
 Return ONLY JSON: {{"lines":[{{"id":0,"tamil":"..."}}]}} with EVERY id exactly once.
 
 INPUT:
@@ -343,7 +354,8 @@ def run_clip(clip, off, chars):
                     "speaker": ln.get("speaker", "C1"),
                     "original": ln.get("original", ""),
                     "tamil": ln["tamil"].strip(),
-                    "emotion": ln.get("emotion", "neutral")})
+                    "emotion": ln.get("emotion", "neutral"),
+                    "event": ln.get("event", "none")})
     return out
 
 
@@ -433,30 +445,54 @@ def fill_gaps(proxy, lines, chars, total):
     return lines
 
 
+ALLOWED_TAGS = {"angry", "shouting", "whispers", "sad", "crying", "scared", "excited", "nervous",
+                "sarcastic", "sighs", "laughs", "chuckles", "gasps", "breathes", "exhales"}
+
+
+def strip_tags(t):
+    return re.sub(r"\[[^\]]*\]\s*", "", t).strip()
+
+
+def clean_tags(t):
+    """Anumadhi illaadha tag-a neekki, max 3 tag mattum vaikkum."""
+    count = [0]
+
+    def f(m):
+        name = m.group(1).strip().lower()
+        if name in ALLOWED_TAGS and count[0] < 3:
+            count[0] += 1
+            return f"[{name}]"
+        return ""
+    return re.sub(r"\s+", " ", re.sub(r"\[([^\]]*)\]", f, t)).strip()
+
+
 def polish(lines, chars):
-    """Ellaa varigalaiyum 'movie dub' pechu Tamil-a maatri ezhuthum."""
-    print("  Tamil-a movie-dub pechu nadaikku maathurom...")
+    """Ellaa varigalaiyum 'original movie dub' pechu + acting-ku maatri ezhuthum (tag, pause, rhythm)."""
+    print("  Dub director pass: original dub pechu nadaikku maathurom...")
     B = 30
     done = 0
     for i in range(0, len(lines), B):
         check_cancel()
-        report(58 + 3 * i / max(1, len(lines)), "பேச்சுத் தமிழா மாத்துது")
+        report(58 + 3 * i / max(1, len(lines)), "ஒரிஜினல் dub நடைக்கு மாத்துது")
         batch = lines[i: i + B]
         items = []
         for k, ln in enumerate(batch):
             c = chars.get(ln["speaker"], {})
+            dur = ln["end"] - ln["start"]
             items.append({"id": k, "who": f"{c.get('age','adult')} {c.get('gender','male')}",
-                          "emotion": ln.get("emotion", "neutral"),
-                          "en": ln.get("original", ""), "ta": ln["tamil"]})
+                          "emotion": ln.get("emotion", "neutral"), "event": ln.get("event", "none"),
+                          "en": ln.get("original", ""), "ta": ln["tamil"],
+                          "max_chars": max(8, int(dur * 13 * 1.15) + 4)})
         prompt = POLISH_PROMPT.format(items=json.dumps(items, ensure_ascii=False))
         try:
             resp = gen(prompt, types.GenerateContentConfig(
-                response_mime_type="application/json", temperature=0.5), what="polish")
+                response_mime_type="application/json", temperature=0.7), what="polish")
             data = parse_json(resp.text)
             for it in data.get("lines", []):
                 k = int(it["id"])
-                t = str(it.get("tamil", "")).strip()
-                if 0 <= k < len(batch) and t and len(t) <= len(batch[k]["tamil"]) * 1.6 + 8:
+                t = clean_tags(str(it.get("tamil", "")).strip())
+                if 0 <= k < len(batch) and strip_tags(t) and \
+                        len(strip_tags(t)) <= items[k]["max_chars"] * 1.4 + 6:
                     batch[k]["tamil_formal"] = batch[k]["tamil"]
                     batch[k]["tamil"] = t
                     done += 1
@@ -512,7 +548,7 @@ def get_eleven_key():
 
 EL_KEY = get_eleven_key()
 EL_URL = "https://api.elevenlabs.io"
-EL_STATE = {"dead": False, "fmt": "pcm_24000", "voices": None}
+EL_STATE = {"dead": False, "fmt": "pcm_24000", "voices": None, "model": ELEVEN_MODEL}
 RATE = {"cps": 13.0}        # Tamil: oru nodiyil ivlo ezhuthu (dub-la irundhu thaanaa kathukkum)
 
 
@@ -528,7 +564,7 @@ def el_req(method, path, what, **kw):
 
 
 def credit_mult():
-    m = ELEVEN_MODEL
+    m = EL_STATE["model"]
     return 0.5 if ("flash" in m or "turbo" in m) else 1.0
 
 
@@ -699,17 +735,26 @@ def decode_audio(b):
     return np.frombuffer(r.stdout, dtype=np.int16).astype(np.float32) / 32768.0
 
 
+def is_expressive(m):
+    return m.startswith("eleven_v3") or m.startswith("eleven_v4")
+
+
 def el_tts(text, voice_id, emotion, prev_text=None, next_text=None):
-    stab, style = {"angry": (0.30, 0.55), "shout": (0.30, 0.60), "scared": (0.35, 0.45),
-                   "happy": (0.40, 0.40), "sad": (0.55, 0.30), "whisper": (0.60, 0.20),
-                   "calm": (0.60, 0.20)}.get(emotion, (0.45, 0.30))
-    m = ELEVEN_MODEL
-    if m.startswith("eleven_v3") or m.startswith("eleven_v4"):
-        vs = {"stability": 0.5, "similarity_boost": 0.85}
-    else:
+    m = EL_STATE["model"]
+    expr = is_expressive(m)
+    if expr:     # v3/v4: audio tag-a nadippaanga; stability = Creative(0) / Natural(0.5)
+        hot = emotion in ("angry", "shout", "scared", "happy")
+        vs = {"stability": 0.0 if hot else 0.5, "similarity_boost": 0.85}
+    else:        # v2/flash: tag-a vaasikkum, athanaala neekkanum
+        text = strip_tags(text)
+        prev_text = strip_tags(prev_text) if prev_text else None
+        next_text = strip_tags(next_text) if next_text else None
+        stab, style = {"angry": (0.30, 0.55), "shout": (0.30, 0.60), "scared": (0.35, 0.45),
+                       "happy": (0.40, 0.40), "sad": (0.55, 0.30), "whisper": (0.60, 0.20),
+                       "calm": (0.60, 0.20)}.get(emotion, (0.45, 0.30))
         vs = {"stability": stab, "similarity_boost": 0.85, "style": style, "use_speaker_boost": True}
     body = {"text": text, "model_id": m, "voice_settings": vs}
-    if not (m.startswith("eleven_v3") or m.startswith("eleven_v4")):
+    if not expr:
         if prev_text:
             body["previous_text"] = prev_text[:400]
         if next_text:
@@ -721,13 +766,21 @@ def el_tts(text, voice_id, emotion, prev_text=None, next_text=None):
         return el_req("POST", f"/v1/text-to-speech/{voice_id}?output_format={fmt}", "eleven-tts", json=body)
 
     try:
-        r = call(EL_STATE["fmt"])
-    except RuntimeError as e:
-        if "output_format" in str(e) and EL_STATE["fmt"] != "mp3_44100_128":
-            EL_STATE["fmt"] = "mp3_44100_128"        # pcm_24000 ungal plan-la illa na mp3
+        try:
             r = call(EL_STATE["fmt"])
-        else:
-            raise
+        except RuntimeError as e:
+            if "output_format" in str(e) and EL_STATE["fmt"] != "mp3_44100_128":
+                EL_STATE["fmt"] = "mp3_44100_128"        # pcm_24000 ungal plan-la illa na mp3
+                r = call(EL_STATE["fmt"])
+            else:
+                raise
+    except RuntimeError as e:
+        msg = str(e)
+        if expr and "model" in msg.lower() and "quota_exceeded" not in msg:
+            print(f"  {m} work aagala -> eleven_multilingual_v2-ku maaruren")
+            EL_STATE["model"] = "eleven_multilingual_v2"
+            return el_tts(text, voice_id, emotion, prev_text, next_text)
+        raise
     if EL_STATE["fmt"].startswith("pcm_"):
         return pcm_to_np(r.content)
     return decode_audio(r.content)
@@ -925,7 +978,7 @@ def step_tts(script, voices):
     gem_voices = assign_voices(chars)      # ElevenLabs fail aana line-ku Gemini kural (backup)
     STATS["fallback"] = 0
     EL_STATE["dead"] = False
-    print(f"[4] {len(lines)} varigalukku Tamil kural ({ELEVEN_MODEL})...")
+    print(f"[4] {len(lines)} varigalukku Tamil kural ({EL_STATE['model']})...")
 
     def work(i):
         check_cancel()
@@ -941,8 +994,8 @@ def step_tts(script, voices):
         orig_len = ln["end"] - ln["start"]
         allowed = max(orig_len, min(nxt - ln["start"] - 0.05, orig_len * 1.6 + 0.5))
         # credits veenaagaama: munnaadiye neelam kooduna varigalai surukkum
-        est = len(text) / RATE["cps"]
-        if est > allowed * 1.25 and len(text) > 12:
+        est = len(strip_tags(text)) / RATE["cps"]
+        if est > allowed * 1.25 and len(strip_tags(text)) > 12:
             try:
                 text = shorten(text, max(0.5, allowed * 1.1 / est))
                 ln["tamil_short"] = text
@@ -962,14 +1015,14 @@ def step_tts(script, voices):
                     report(70, "⚠️ ElevenLabs credits முடிந்தது. மீதி வரிகள் Gemini குரலில்")
         if audio is None or len(audio) < int(0.15 * SR):
             try:
-                audio = tts(text, gem_voices.get(sp, "Kore"), style_text(c, emotion))
+                audio = tts(strip_tags(text), gem_voices.get(sp, "Kore"), style_text(c, emotion))
                 STATS["fallback"] += 1
             except Exception as e:  # noqa
                 print(f"  line {i} Gemini TTS-um fail: {str(e)[:120]}")
                 return i, np.zeros(int(0.1 * SR), dtype=np.float32)
         dur = len(audio) / SR
-        if dur > 0.6 and len(text) > 6:
-            RATE["cps"] = 0.7 * RATE["cps"] + 0.3 * (len(text) / dur)
+        if dur > 0.6 and len(strip_tags(text)) > 6:
+            RATE["cps"] = 0.7 * RATE["cps"] + 0.3 * (len(strip_tags(text)) / dur)
         if dur > allowed:
             audio = speed_np(audio, min(dur / allowed, MAX_SPEEDUP))
         audio = declick(audio)
@@ -1041,10 +1094,11 @@ def step_mix(video, bgm, lines, audios):
 
 
 # ----------------------------- MAIN -----------------------------------------
-def dub(video, job_dir, progress=None, fmt="mp4"):
+def dub(video, job_dir, progress=None, fmt="mp4", model=None):
     """Video-va Tamil-la (asal kural clone-oda) dub panni output path-a tharum. progress(pct, text)."""
     global WORK, OUTPUT_VIDEO, _PROG
     _PROG = progress or (lambda p, t: print(f"[{p}%] {t}"))
+    EL_STATE["model"] = model or ELEVEN_MODEL
     WORK = os.path.join(job_dir, "work")
     fmt = "mkv" if str(fmt).lower() == "mkv" else "mp4"
     OUTPUT_VIDEO = os.path.join(job_dir, f"dubbed_tamil.{fmt}")
