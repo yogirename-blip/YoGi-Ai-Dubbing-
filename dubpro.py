@@ -35,7 +35,7 @@ MAX_CLONES   = int(os.environ.get("MAX_CLONES", "8"))     # evlo character-ku ku
 KEEP_VOICES  = os.environ.get("KEEP_VOICES", "0") == "1"  # 1 na clone voices-a delete pannaadhu
 MIN_SAMPLE_S = 6.0       # idhukku kuraivaana sample na clone panna maatom (premade voice use aagum)
 VOICE_PREFIX = "dubbot_"
-BGM_VOLUME   = 0.9
+BGM_VOLUME   = 1.0     # asal mix-la vocals:BGM 1:1 -> adhe alavu
 VOICE_VOLUME = 1.0
 SR           = 24000     # Gemini TTS output sample rate
 # ----------------------------------------------------------------------------
@@ -1188,7 +1188,7 @@ def shorten(text, ratio, lang="ta"):
 
 def speed_np(x, factor):
     """ffmpeg atempo (pitch maaraamal vegam)."""
-    if factor <= 1.01:
+    if 0.99 <= factor <= 1.01:
         return x
     uid = uuid.uuid4().hex[:10]       # thread-ku thani file (munnadi ore file-a share panni mix aachu)
     tmp_in, tmp_out = os.path.join(WORK, f"_s_{uid}_in.wav"), os.path.join(WORK, f"_s_{uid}_out.wav")
@@ -1296,6 +1296,8 @@ def step_tts(script, voices, lang="ta", base_pct=67, span=25):
             RATE[lang] = 0.7 * RATE[lang] + 0.3 * (len(strip_tags(text)) / dur)
         if dur > allowed:
             audio = speed_np(audio, min(dur / allowed, MAX_SPEEDUP))
+        elif orig_len > 1.0 and dur < orig_len * 0.75:      # romba kuraivaa mudinja asal vaai asaivu-kku match aaga konjam nidhaanamaa
+            audio = speed_np(audio, max(0.85, dur / (orig_len * 0.9)))
         audio = declick(audio)
         write_wav(path, audio)
         return i, audio
@@ -1332,9 +1334,31 @@ def step_mix(video, bgm, lines, audios_by_lang, langs):
     print("[5] Ellathaiyum serkkirom...")
     total = duration(video)
     tracks = []
+    voc_p = os.path.join(WORK, "vocals.wav")
+    ref = load_pcm(voc_p).astype(np.float32) / 32768.0 if os.path.exists(voc_p) else None
+
+    def active_rms(x, thr=0.02):
+        v = x[np.abs(x) > thr]
+        return float(np.sqrt(np.mean(v * v))) if len(v) > 200 else 0.0
+
+    def match_loud(ln, a):
+        """Dub vari-yoda sathatham asal vari-yoda sathatham-ku samam (kathal = kathal, mella = mella)."""
+        if ref is None:
+            return a
+        o = ref[int(ln["start"] * 44100): int(ln["end"] * 44100)]
+        ro, rd = active_rms(o), active_rms(a)
+        if ro <= 0 or rd <= 0:
+            return a
+        g = float(np.clip(ro / rd, 0.4, 2.5))
+        pk = float(np.abs(a).max()) * g
+        if pk > 0.98:
+            g *= 0.98 / pk
+        return a * g
+
     for lg in langs:
         track = np.zeros(int((total + 5) * SR), dtype=np.float32)
         for ln, a in zip(lines, audios_by_lang[lg]):
+            a = match_loud(ln, a)
             s = int(ln["start"] * SR)
             e = min(len(track), s + len(a))
             if s < len(track):
