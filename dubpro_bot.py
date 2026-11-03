@@ -48,7 +48,9 @@ client = TelegramClient(os.path.join(BASE, "bot_session"), API_ID, API_HASH)
 queue: asyncio.Queue = asyncio.Queue()
 JOBS = {}          # job_id -> Job
 CURRENT = None     # ippo odittu irukkura Job
-SETTINGS = {}      # user_id -> {"fmt": "mp4|mkv", "send": "video|document"}
+MODES = {"expressive": "eleven_v3", "stable": "eleven_multilingual_v2", "economy": "eleven_flash_v2_5"}
+MODE_TXT = {"expressive": "நடிப்பு (v3)", "stable": "நிலையான (v2)", "economy": "சிக்கனம் (flash, credit பாதி)"}
+SETTINGS = {}      # user_id -> {"fmt": "mp4|mkv", "send": "video|document", "mode": "expressive|stable|economy"}
 STOPPING = False
 
 
@@ -90,12 +92,12 @@ async def announce(text):
 
 
 def prefs(uid):
-    return SETTINGS.setdefault(uid, {"fmt": "mp4", "send": "video"})
+    return SETTINGS.setdefault(uid, {"fmt": "mp4", "send": "video", "mode": "expressive"})
 
 
 def describe(p):
     send = "document (file)" if p["send"] == "document" or p["fmt"] == "mkv" else "video"
-    return f"Format: {p['fmt'].upper()} | அனுப்பும் முறை: {send}"
+    return f"Format: {p['fmt'].upper()} | அனுப்பும் முறை: {send} | குரல்: {MODE_TXT[p.get('mode', 'expressive')]}"
 
 
 def is_video(msg):
@@ -106,7 +108,8 @@ def is_video(msg):
 
 
 class Job:
-    def __init__(self, event, fmt, send):
+    def __init__(self, event, fmt, send, mode="expressive"):
+        self.mode = mode
         self.event = event
         self.id = f"{event.sender_id}x{int(time.time() * 1000) % 10 ** 9}"
         self.fmt, self.send = fmt, send
@@ -149,6 +152,7 @@ async def start(event):
     await event.reply("வணக்கம்! 🎬 ஒரு வீடியோ அனுப்புங்க. ஒவ்வொரு கேரக்டரோட அசல் குரலையே clone செய்து, பேச்சுத் தமிழில் dub செய்து அனுப்புறேன்.\n"
                       "(நீளமான வீடியோவுக்கு நேரம் ஆகும். ஒரு நேரத்தில் ஒரு வீடியோ மட்டும்.)\n\n"
                       "வடிவம்: /mp4 /mkv  |  அனுப்பும் முறை: /video /document\n"
+                      "குரல் நடை: /expressive (நடிப்பு, default)  /stable  /economy\n"
                       "நிலை: /status  |  நிறுத்த: /cancel  |  /settings")
 
 
@@ -157,7 +161,7 @@ async def my_id(event):
     await event.reply(f"உங்க ID: {event.sender_id}")
 
 
-@client.on(events.NewMessage(pattern=r"^/(mp4|mkv|video|document|settings)"))
+@client.on(events.NewMessage(pattern=r"^/(mp4|mkv|video|document|settings|expressive|stable|economy)"))
 async def set_pref(event):
     cmd = event.raw_text.split()[0].lstrip("/").split("@")[0].lower()
     p = prefs(event.sender_id)
@@ -165,10 +169,12 @@ async def set_pref(event):
         p["fmt"] = cmd
     elif cmd in ("video", "document"):
         p["send"] = cmd
+    elif cmd in MODES:
+        p["mode"] = cmd
     extra = ""
     if p["fmt"] == "mkv":
         extra = "\n(MKV: தமிழ் + அசல் ஆடியோ இரண்டு track இருக்கும். Telegram-ல் file-ஆகத்தான் போகும்.)"
-    await event.reply("✅ " + describe(p) + extra + "\n\nமாற்ற: /mp4 /mkv /video /document")
+    await event.reply("✅ " + describe(p) + extra + "\n\nமாற்ற: /mp4 /mkv /video /document  |  குரல்: /expressive /stable /economy")
 
 
 @client.on(events.NewMessage(pattern=r"^/status"))
@@ -227,11 +233,12 @@ async def on_file(event):
     cap = (event.raw_text or "").lower()        # caption-la 'mkv' / 'doc' ezhuthina adhu mudhal
     fmt = "mkv" if "mkv" in cap else ("mp4" if "mp4" in cap else p["fmt"])
     send = "document" if ("doc" in cap or "file" in cap) else p["send"]
-    job = Job(event, fmt, send)
+    mode = next((m for m in MODES if m in cap), p.get("mode", "expressive"))
+    job = Job(event, fmt, send, mode)
     JOBS[job.id] = job
     pos = queue.qsize() + (1 if CURRENT else 0)
     job.msg = await event.reply(
-        f"வீடியோ கிடைத்தது ✅ வரிசையில் இருக்கு (முன்னாடி {pos})\n{describe({'fmt': fmt, 'send': send})}",
+        f"வீடியோ கிடைத்தது ✅ வரிசையில் இருக்கு (முன்னாடி {pos})\n{describe({'fmt': fmt, 'send': send, 'mode': mode})}",
         buttons=job.cancel_button())
     await queue.put(job)
 
@@ -267,7 +274,7 @@ async def worker():
 
             def run_job():
                 try:
-                    return "ok", tamil_dub.dub(src, jobdir, progress, job.fmt)
+                    return "ok", tamil_dub.dub(src, jobdir, progress, job.fmt, MODES[job.mode])
                 except tamil_dub.Cancelled:
                     return "cancelled", None
 
