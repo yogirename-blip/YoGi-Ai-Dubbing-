@@ -9,7 +9,7 @@ Optional: TELEGRAM_ALLOWED (unga Telegram id), TTS_WORKERS, TZ_OFFSET_MIN, SESSI
 
 Run:  run.bat  (double-click)   illa   python dubpro_bot.py
 """
-import os, sys, asyncio, shutil, time, traceback, subprocess, signal, json, datetime
+import os, sys, asyncio, shutil, time, traceback, subprocess, signal, json, datetime, re
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import envload  # noqa  (.env padikkum)
 
@@ -84,12 +84,16 @@ async def announce(text):
 
 
 def prefs(uid):
-    return SETTINGS.setdefault(uid, {"fmt": "mp4", "send": "video", "mode": "expressive"})
+    return SETTINGS.setdefault(uid, {"fmt": "mp4", "send": "video", "mode": "expressive", "langs": ["ta"]})
 
 
 def describe(p):
-    send = "document (file)" if p["send"] == "document" or p["fmt"] == "mkv" else "video"
-    return f"Format: {p['fmt'].upper()} | அனுப்பும் முறை: {send} | குரல்: {MODE_TXT[p.get('mode', 'expressive')]}"
+    ls = p.get("langs") or ["ta"]
+    multi = len(ls) > 1
+    send = "document (file)" if p["send"] == "document" or p["fmt"] == "mkv" or multi else "video"
+    fmt = "MKV (பல ஆடியோ)" if multi else p["fmt"].upper()
+    names = " + ".join(tamil_dub.LANGS[l]["native"] for l in ls)
+    return f"மொழி: {names} | Format: {fmt} | அனுப்பும் முறை: {send} | குரல்: {MODE_TXT[p.get('mode', 'expressive')]}"
 
 
 def is_video(msg):
@@ -100,8 +104,11 @@ def is_video(msg):
 
 
 class Job:
-    def __init__(self, event, fmt, send, mode="expressive"):
+    def __init__(self, event, fmt, send, mode="expressive", langs=None):
         self.mode = mode
+        self.langs = langs or ["ta"]
+        if len(self.langs) > 1:          # palamozhi = MKV file (multi-audio)
+            fmt, send = "mkv", "document"
         self.event = event
         self.id = f"{event.sender_id}x{int(time.time() * 1000) % 10 ** 9}"
         self.fmt, self.send = fmt, send
@@ -145,6 +152,7 @@ async def start(event):
                       "(நீளமான வீடியோவுக்கு நேரம் ஆகும். ஒரு நேரத்தில் ஒரு வீடியோ மட்டும்.)\n\n"
                       "வடிவம்: /mp4 /mkv  |  அனுப்பும் முறை: /video /document\n"
                       "குரல் நடை: /expressive (நடிப்பு, default)  /stable  /economy\n"
+                      "மொழி: /lang tamil telugu malayalam kannada  (எத்தனை வேணாலும், /lang all = நான்கும்)\n"
                       "நிலை: /status  |  நிறுத்த: /cancel  |  /settings")
 
 
@@ -167,6 +175,18 @@ async def set_pref(event):
     if p["fmt"] == "mkv":
         extra = "\n(MKV: தமிழ் + அசல் ஆடியோ இரண்டு track இருக்கும். Telegram-ல் file-ஆகத்தான் போகும்.)"
     await event.reply("✅ " + describe(p) + extra + "\n\nமாற்ற: /mp4 /mkv /video /document  |  குரல்: /expressive /stable /economy")
+
+
+@client.on(events.NewMessage(pattern=r"^/lang"))
+async def lang_cmd(event):
+    p = prefs(event.sender_id)
+    parts = event.raw_text.split(maxsplit=1)
+    if len(parts) > 1:
+        p["langs"] = tamil_dub.parse_langs(parts[1])
+    extra = "\n(பல மொழி = ஒரே MKV file-ல ஒவ்வொரு மொழிக்கும் தனி audio track. Player-ல audio மாற்றலாம்.)" \
+        if len(p["langs"]) > 1 else ""
+    await event.reply("✅ " + describe(p) + extra +
+                      "\n\nமாற்ற: /lang tamil telugu malayalam kannada | /lang all | /lang tamil")
 
 
 @client.on(events.NewMessage(pattern=r"^/status"))
@@ -225,11 +245,14 @@ async def on_file(event):
     fmt = "mkv" if "mkv" in cap else ("mp4" if "mp4" in cap else p["fmt"])
     send = "document" if ("doc" in cap or "file" in cap) else p["send"]
     mode = next((m for m in MODES if m in cap), p.get("mode", "expressive"))
-    job = Job(event, fmt, send, mode)
+    words = [t for t in re.split(r"[\s,+/|]+", cap) if t in tamil_dub.LANG_LONG_SET]
+    langs = tamil_dub.parse_langs(words) if words else (p.get("langs") or ["ta"])
+    job = Job(event, fmt, send, mode, langs)
+    fmt, send = job.fmt, job.send
     JOBS[job.id] = job
     pos = queue.qsize() + (1 if CURRENT else 0)
     job.msg = await event.reply(
-        f"வீடியோ கிடைத்தது ✅ வரிசையில் இருக்கு (முன்னாடி {pos})\n{describe({'fmt': fmt, 'send': send, 'mode': mode})}",
+        f"வீடியோ கிடைத்தது ✅ வரிசையில் இருக்கு (முன்னாடி {pos})\n{describe({'fmt': fmt, 'send': send, 'mode': mode, 'langs': langs})}",
         buttons=job.cancel_button())
     await queue.put(job)
 
@@ -265,7 +288,7 @@ async def worker():
 
             def run_job():
                 try:
-                    return "ok", tamil_dub.dub(src, jobdir, progress, job.fmt, MODES[job.mode])
+                    return "ok", tamil_dub.dub(src, jobdir, progress, job.fmt, MODES[job.mode], job.langs)
                 except tamil_dub.Cancelled:
                     return "cancelled", None
 
@@ -280,7 +303,11 @@ async def worker():
                         asyncio.ensure_future(update(job, 95 + 5 * cur / tot, "அனுப்புது"))
 
                 as_doc = job.send == "document" or job.fmt == "mkv"
-                await client.send_file(event.chat_id, out, caption="தமிழ் dub 🎧",
+                names = " + ".join(tamil_dub.LANGS[l]["native"] for l in job.langs)
+                cap_txt = f"{names} dub 🎧"
+                if tamil_dub.NOTES:
+                    cap_txt += "\n⚠️ " + "\n".join(tamil_dub.NOTES)[:800]
+                await client.send_file(event.chat_id, out, caption=cap_txt,
                                        force_document=as_doc, supports_streaming=not as_doc,
                                        reply_to=event.id, progress_callback=up_cb)
                 await update(job, 100, "முடிந்தது ✅", force=True, buttons=False)
