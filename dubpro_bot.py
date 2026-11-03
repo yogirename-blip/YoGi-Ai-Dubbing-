@@ -1,25 +1,17 @@
 """
-Tamil Pro Dub Telegram Bot (ElevenLabs voice clone)
-======================
+Tamil Pro Dub Telegram Bot (laptop version: ElevenLabs voice clone)
+===================================================================
 Telegram-la video anuppunga -> bot Tamil-la dub panni thirumba anuppum.
 
-Secrets (Kaggle -> Add-ons -> Secrets):
-  GEMINI_API_KEY      aistudio.google.com/apikey
-  ELEVENLABS_API_KEY  elevenlabs.io -> profile -> API Keys
-  TELEGRAM_BOT_TOKEN  Telegram-la @BotFather -> /newbot
-  TELEGRAM_API_ID     my.telegram.org -> API development tools
-  TELEGRAM_API_HASH   (adhe pakkam)
+Keys ellam .env file-la (.env.example-a copy panni .env nu peyar maathunga):
+  GEMINI_API_KEY, ELEVENLABS_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_API_ID, TELEGRAM_API_HASH
+Optional: TELEGRAM_ALLOWED (unga Telegram id), TTS_WORKERS, TZ_OFFSET_MIN, SESSION_HOURS (0 = limit illa)
 
-Optional env:
-  TELEGRAM_ALLOWED    unga Telegram user id (/id anuppina therium). Idhai KANDIPPA set pannunga:
-                      1) unga quota-va yaarum use panna mudiyaadhu
-                      2) bot online/offline aana notice unga-ku varum
-  SESSION_HOURS       Kaggle session limit (default 12) - mudiya pogum munnaadi warning varum
-  TZ_OFFSET_MIN       neram kaattura offset (default 330 = India)
-
-Run:  !python New-Dubbed-/dubpro_bot.py
+Run:  run.bat  (double-click)   illa   python dubpro_bot.py
 """
 import os, sys, asyncio, shutil, time, traceback, subprocess, signal, json, datetime
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import envload  # noqa  (.env padikkum)
 
 try:
     import telethon  # noqa
@@ -36,10 +28,10 @@ API_ID = int(os.environ["TELEGRAM_API_ID"])
 API_HASH = os.environ["TELEGRAM_API_HASH"]
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ALLOWED = {int(x) for x in os.environ.get("TELEGRAM_ALLOWED", "").replace(" ", "").split(",") if x}
-SESSION_HOURS = float(os.environ.get("SESSION_HOURS", "12"))
+SESSION_HOURS = float(os.environ.get("SESSION_HOURS", "0"))   # laptop-la 0 = limit illa
 TZ_OFFSET = int(os.environ.get("TZ_OFFSET_MIN", "330"))
 
-BASE = "/kaggle/working/jobs" if os.path.exists("/kaggle/working") else "./jobs"
+BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jobs")
 os.makedirs(BASE, exist_ok=True)
 START = time.time()
 USERS_FILE = os.path.join(BASE, "users.json")
@@ -180,9 +172,8 @@ async def set_pref(event):
 @client.on(events.NewMessage(pattern=r"^/status"))
 async def status(event):
     up = int((time.time() - START) / 60)
-    left = max(0, int(SESSION_HOURS * 60 - up))
     cur = f"ஓடுது: {CURRENT.last_text.splitlines()[0]}" if CURRENT else "இப்போ வேலை எதுவும் இல்ல"
-    await event.reply(f"🟢 Bot online\nஓடிய நேரம்: {up} நிமிடம் (session முடிய ~{left} நிமிடம்)\n"
+    await event.reply(f"🟢 Bot online (laptop)\nஓடிய நேரம்: {up} நிமிடம்\n"
                       f"வரிசையில்: {queue.qsize()}\n{cur}")
 
 
@@ -321,10 +312,10 @@ async def heartbeat():
     while True:
         await asyncio.sleep(300)
         up_h = (time.time() - START) / 3600
-        if not warned and up_h >= SESSION_HOURS - 0.75:
+        if SESSION_HOURS > 0 and not warned and up_h >= SESSION_HOURS - 0.75:
             warned = True
-            await announce("⚠️ Kaggle session வரம்பு நெருங்குது (~45 நிமிடத்தில் நிற்கும்). "
-                           "நின்றதும் Kaggle-ல் மறுபடி Run செய்யுங்க.")
+            await announce("⚠️ session வரம்பு நெருங்குது (~45 நிமிடத்தில் நிற்கும்). "
+                           "நின்றதும் மறுபடி Run செய்யுங்க.")
         for uid, m in list(msgs.items()):
             try:
                 await m.edit(f"🟢 Bot online\nகடைசி உயிர்ப்பு: {now_str()}")
@@ -337,7 +328,7 @@ async def shutdown(reason):
     if STOPPING:
         return
     STOPPING = True
-    text = f"🔴 Bot OFFLINE ({reason}, {now_str()})\nKaggle-ல் மறுபடி Run செய்து ஆன் பண்ணுங்க."
+    text = f"🔴 Bot OFFLINE ({reason}, {now_str()})\nLaptop-ல் run.bat மறுபடி ஓட்டி ஆன் பண்ணுங்க."
     if CURRENT:
         text += "\n⚠️ ஓடிக்கொண்டிருந்த வீடியோ பாதியில் நின்றது. ON ஆனதும் மறுபடி அனுப்புங்க."
         tamil_dub.CANCEL.set()
@@ -348,7 +339,18 @@ async def shutdown(reason):
     await client.disconnect()
 
 
+def keep_awake():
+    """Windows laptop sleep aagi bot nikkaama irukka (screen off aanaalum odum)."""
+    if os.name == "nt":
+        try:
+            import ctypes
+            ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000001)  # CONTINUOUS | SYSTEM_REQUIRED
+        except Exception:
+            pass
+
+
 async def main():
+    keep_awake()
     await client.start(bot_token=BOT_TOKEN)
     me = await client.get_me()
     print(f"Bot ready: @{me.username}  (Telegram-la poi /start anuppunga)")
