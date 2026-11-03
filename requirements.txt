@@ -1,0 +1,6 @@
+google-genai
+requests
+telethon
+numpy
+soundfile
+demucs
