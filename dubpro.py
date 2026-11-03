@@ -331,19 +331,35 @@ for _m in [os.environ.get("GEMINI_TEXT_MODEL"), TEXT_MODEL,
         TEXT_MODELS.append(_m)
 
 
+def _busy(e):
+    m = str(e)
+    return any(k in m for k in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "overloaded", "high demand", "504", "DEADLINE"))
+
+
 def gen(contents, config=None, what="gemini"):
-    """Text/video model-ku call. Oru model fail aana adutha model-ku maarum."""
+    """Text/video model-ku call. Oru model fail aana adutha model-ku maarum.
+    Ellaa model-um 'high demand (503)' nu sonna -> konjam kaathirundhu, muzhu list-ayum thirumba try (8 round varai)."""
     last = None
-    for m in TEXT_MODELS:
-        try:
-            r = retry(lambda: client.models.generate_content(
-                model=m, contents=contents, config=config), tries=4, what=f"{what}:{m}")
-            if m != TEXT_MODELS[0]:
-                print(f"  ({m} use aachu)")
-            return r
-        except Exception as e:  # noqa
-            last = e
-            print(f"  {m} work aagala, adutha model try pannuren...")
+    rounds = int(os.environ.get("GEMINI_ROUNDS", "8"))
+    for rnd in range(rounds):
+        busy = 0
+        for m in TEXT_MODELS:
+            try:
+                r = retry(lambda: client.models.generate_content(
+                    model=m, contents=contents, config=config), tries=2, base=4.0, what=f"{what}:{m}")
+                if m != TEXT_MODELS[0]:
+                    print(f"  ({m} use aachu)")
+                return r
+            except Exception as e:  # noqa
+                last = e
+                busy += 1 if _busy(e) else 0
+                print(f"  {m} work aagala, adutha model try pannuren...")
+        if busy < len(TEXT_MODELS) or rnd == rounds - 1:
+            break                                   # 503 alla (vera thavaru) -> kaathirundhu payan illa
+        wait = min(30 * (rnd + 1), 150)
+        print(f"  Gemini ellaa model-um busy (503). {wait}s kaathirundhu thirumba try (round {rnd + 2}/{rounds})...")
+        CANCEL.wait(wait)
+        check_cancel()
     raise RuntimeError(f"ellaa models-um fail. Kadaisi error: {str(last)[:300]}")
 
 
