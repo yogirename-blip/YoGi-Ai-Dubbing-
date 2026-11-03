@@ -540,6 +540,20 @@ async def shutdown(reason):
     await client.disconnect()
 
 
+def disable_quickedit():
+    """Windows console-la click pannina program freeze aagum (QuickEdit). Adhai off pannum."""
+    if os.name == "nt":
+        try:
+            import ctypes
+            k = ctypes.windll.kernel32
+            h = k.GetStdHandle(-10)
+            m = ctypes.c_uint32()
+            if k.GetConsoleMode(h, ctypes.byref(m)):
+                k.SetConsoleMode(h, (m.value & ~0x0040) | 0x0080)
+        except Exception:
+            pass
+
+
 def keep_awake():
     """Windows laptop sleep aagi bot nikkaama irukka (screen off aanaalum odum)."""
     if os.name == "nt":
@@ -551,6 +565,7 @@ def keep_awake():
 
 
 async def main():
+    disable_quickedit()
     keep_awake()
     await client.start(bot_token=BOT_TOKEN)
     me = await client.get_me()
