@@ -1,0 +1,10 @@
+# Indha file-a ".env" nu peyar maathi unga keys-a ezhuthunga (quotes vendaam)
+GEMINI_API_KEY=
+ELEVENLABS_API_KEY=
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_API_ID=
+TELEGRAM_API_HASH=
+# unga Telegram user id (bot-ku /id anuppina therium) - kandippa podunga
+TELEGRAM_ALLOWED=
+# ElevenLabs 429 niraya vandha 2 (illa 1) aakkunga
+TTS_WORKERS=3
